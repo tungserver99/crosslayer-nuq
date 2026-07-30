@@ -12,7 +12,11 @@ from tqdm.auto import trange
 from ..analyzer import get_analyzer
 from .activations import accumulate_saliency_weighted_hessians, get_inps
 from .config import *
-from .crosslayer_stats import compute_propagated_R, flatten_calibration_tensor, update_error_accumulator
+from .crosslayer_stats import (
+    compute_grouped_propagated_R,
+    flatten_calibration_tensor,
+    update_grouped_error_accumulator,
+)
 from .gradients import load_signed_gradient_layer, signed_gradient_cache_complete
 from .datautils import get_tokens
 from .endloss_crosslayer_quantize import seed as endloss_crosslayer_seed
@@ -34,11 +38,21 @@ def _prepare_calibration_batches(tokens):
 
 
 class CrossLayerPropagationRuntime:
-    def __init__(self, analyzer, tokens, signed_gradients_path: str, initial_activations_cache_path: Optional[str] = None):
+    def __init__(
+        self,
+        analyzer,
+        tokens,
+        signed_gradients_path: str,
+        num_groups: int,
+        initial_activations_cache_path: Optional[str] = None,
+    ):
+        if num_groups is None or num_groups < 1:
+            raise ValueError(f"num_groups must be a positive integer, got {num_groups}")
         self.analyzer = analyzer
         self.tokens = tokens
         self.calibration_batches = _prepare_calibration_batches(tokens)
         self.signed_gradients_path = signed_gradients_path
+        self.num_groups = int(num_groups)
         self.layers = analyzer.get_layers()
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.devices = [self.device]
@@ -61,7 +75,7 @@ class CrossLayerPropagationRuntime:
                 os.makedirs(os.path.dirname(initial_activations_cache_path), exist_ok=True)
                 torch.save({"inps": [inp.cpu() for inp in self.inps], "forward_args": self.forward_args}, initial_activations_cache_path)
         self.outs = [torch.zeros_like(inp) for inp in self.inps]
-        self.c = None
+        self.group_accumulator = None
         self.current_inputs: Dict[str, torch.Tensor] = {}
         self.current_signed: Dict[str, torch.Tensor] = {}
         self.current_layer_idx = None
@@ -118,18 +132,39 @@ class CrossLayerPropagationRuntime:
 
         first_module = module_names[0]
         token_count = flatten_calibration_tensor(self.current_signed[first_module]).shape[0]
-        if self.c is None:
-            self.c = torch.zeros(token_count, dtype=torch.float32)
+        for signed_name, signed in self.current_signed.items():
+            signed_token_count = flatten_calibration_tensor(signed).shape[0]
+            if signed_token_count != token_count:
+                raise ValueError(
+                    f"Signed-gradient token count for {signed_name} differs: "
+                    f"{signed_token_count} vs {token_count}"
+                )
+        if self.group_accumulator is None:
+            self.group_accumulator = torch.zeros(token_count, self.num_groups, dtype=torch.float32)
+        elif self.group_accumulator.shape != (token_count, self.num_groups):
+            raise ValueError(
+                "EndLoss group accumulator has shape "
+                f"{tuple(self.group_accumulator.shape)}, expected ({token_count}, {self.num_groups})"
+            )
 
         layer_R = []
         for module_name in module_names:
             r_start = time.perf_counter()
             X = self.current_inputs[module_name]
             D = self.current_signed[module_name]
-            R = compute_propagated_R(X, D, self.c, normalize_by_tokens=False)
-            # H is averaged over output rows/groups; distribute scalar feedback across rows.
-            R = R / D.shape[-1]
+            R = compute_grouped_propagated_R(
+                X,
+                D,
+                self.group_accumulator,
+                self.num_groups,
+                normalize_by_tokens=False,
+            )
             layer_R.append(R.cpu().float().numpy())
+            logging.info(
+                f"[Layer {layer_idx}][{module_name}] propagated R "
+                f"mean={R.mean().item():.4e}, std={R.std().item():.4e}, "
+                f"max_abs={R.abs().max().item():.4e}"
+            )
             logging.info(f"[Layer {layer_idx}][{module_name}] Computed propagated R GEMM in {time.perf_counter() - r_start:.2f}s")
         return layer_R
 
@@ -139,15 +174,30 @@ class CrossLayerPropagationRuntime:
             X = self.current_inputs[module_name]
             D = self.current_signed[module_name]
             error = torch.from_numpy(quantized_weight - fp_weight).float()
-            self.c = update_error_accumulator(self.c, X, D, error).cpu()
-            logging.info(f"[Layer {layer_idx}][{module_name}] Updated EndLoss accumulator in {time.perf_counter() - update_start:.2f}s")
+            self.group_accumulator = update_grouped_error_accumulator(
+                self.group_accumulator,
+                X,
+                D,
+                error,
+                self.num_groups,
+            ).cpu()
+            quantized_weight_max_abs = torch.as_tensor(quantized_weight).float().abs().max().item()
+            logging.info(
+                f"[Layer {layer_idx}][{module_name}] Updated EndLoss group accumulator "
+                f"in {time.perf_counter() - update_start:.2f}s; "
+                f"quantized_weight_max_abs={quantized_weight_max_abs:.4e}"
+            )
 
-        if torch.isfinite(self.c).logical_not().any():
-            raise ValueError(f"Non-finite EndLoss accumulator after layer {layer_idx}")
+        if torch.isfinite(self.group_accumulator).logical_not().any():
+            raise ValueError(f"Non-finite EndLoss group accumulator after layer {layer_idx}")
 
+        group_max_abs = self.group_accumulator.abs().amax(dim=0)
         logging.info(
-            f"[Layer {layer_idx}] accumulator mean={self.c.mean().item():.4e}, "
-            f"std={self.c.std().item():.4e}, max_abs={self.c.abs().max().item():.4e}"
+            f"[Layer {layer_idx}] group accumulator "
+            f"mean={self.group_accumulator.mean().item():.4e}, "
+            f"std={self.group_accumulator.std().item():.4e}, "
+            f"max_abs={self.group_accumulator.abs().max().item():.4e}, "
+            f"per_group_max_abs={group_max_abs.tolist()}"
         )
         if is_last_module:
             transition_start = time.perf_counter()
@@ -180,6 +230,10 @@ def endloss_crosslayer_nuq(
         is_nosal=False,
         signed_gradients_path=None,
 ):
+    if num_groups is None or num_groups < 1:
+        raise ValueError(f"num_groups must be a positive integer, got {num_groups}")
+    num_groups = int(num_groups)
+
     model_string = model if isinstance(model, str) else model.name_or_path
     model_name = model_string.split("/")[-1]
 
@@ -248,8 +302,6 @@ def endloss_crosslayer_nuq(
     if mode == 'hessians':
         return
 
-    # Hessian accumulation mutates/offloads layer modules while streaming activations.
-    # Start EndLoss propagation from a fresh analyzer so get_inps sees a clean model.
     analyzer = get_analyzer(model, yaml_path=yaml_path, include_tokenizer=True)
     module_names = analyzer.module_names
 
@@ -263,7 +315,13 @@ def endloss_crosslayer_nuq(
         logging.info(f"Detected cached EndLoss cross-layer quantization at {quantized_cache_path}. Will delete and recalculate.")
         shutil.rmtree(quantized_cache_path)
 
-    runtime = CrossLayerPropagationRuntime(analyzer, tokens, signed_gradients_path, initial_activations_cache_path)
+    runtime = CrossLayerPropagationRuntime(
+        analyzer,
+        tokens,
+        signed_gradients_path,
+        num_groups,
+        initial_activations_cache_path,
+    )
     endloss_crosslayer_seed(
         analyzer=analyzer,
         module_names=module_names,
@@ -301,13 +359,3 @@ def endloss_crosslayer_nuq(
         cpu_count=cpu_count,
     )
     logging.info("Packing complete.")
-
-
-
-
-
-
-
-
-
-

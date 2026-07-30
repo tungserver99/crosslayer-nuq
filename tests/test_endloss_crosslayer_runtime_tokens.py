@@ -33,9 +33,9 @@ def load_runtime_module():
     modules["any_precision.quantization.config"].DEFAULT_DATASET = "c4"
     modules["any_precision.quantization.config"].DEFAULT_SEQ_LEN = 2048
     modules["any_precision.quantization.config"].DEFAULT_NUM_EXAMPLES = 128
-    modules["any_precision.quantization.crosslayer_stats"].compute_propagated_R = lambda *args, **kwargs: None
+    modules["any_precision.quantization.crosslayer_stats"].compute_grouped_propagated_R = lambda *args, **kwargs: None
     modules["any_precision.quantization.crosslayer_stats"].flatten_calibration_tensor = lambda tensor: tensor.reshape(-1, tensor.shape[-1])
-    modules["any_precision.quantization.crosslayer_stats"].update_error_accumulator = lambda *args, **kwargs: None
+    modules["any_precision.quantization.crosslayer_stats"].update_grouped_error_accumulator = lambda *args, **kwargs: None
     modules["any_precision.quantization.datautils"].get_tokens = lambda *args, **kwargs: None
     modules["any_precision.quantization.endloss_crosslayer_quantize"].seed = lambda *args, **kwargs: None
     modules["any_precision.quantization.pack"].pack = lambda *args, **kwargs: None
@@ -77,25 +77,24 @@ def test_prepare_calibration_batches_keeps_2d_tokens():
     assert batches[0] is tokens[0]
 
 
-def test_layer_r_provider_keeps_token_sum_and_scales_by_output_rows(monkeypatch):
+def test_layer_r_provider_uses_grouped_statistics_without_extra_row_scaling(monkeypatch):
     runtime_module = load_runtime_module()
-    runtime = runtime_module.CrossLayerPropagationRuntime.__new__(
-        runtime_module.CrossLayerPropagationRuntime
-    )
+    runtime = runtime_module.CrossLayerPropagationRuntime.__new__(runtime_module.CrossLayerPropagationRuntime)
     runtime.current_layer_idx = 0
     runtime.current_inputs = {"proj": torch.ones(1, 2, 3)}
     runtime.current_signed = {"proj": torch.ones(1, 2, 4)}
-    runtime.c = torch.ones(2)
+    runtime.num_groups = 2
+    runtime.group_accumulator = torch.ones(2, 2)
 
     calls = []
 
-    def fake_compute_propagated_r(X, D, c, normalize_by_tokens=True):
-        calls.append(normalize_by_tokens)
+    def fake_compute_grouped_r(X, D, group_accumulator, num_groups, normalize_by_tokens=False):
+        calls.append((num_groups, normalize_by_tokens))
         return torch.full((D.shape[-1], X.shape[-1]), 8.0)
 
-    monkeypatch.setattr(runtime_module, "compute_propagated_R", fake_compute_propagated_r)
+    monkeypatch.setattr(runtime_module, "compute_grouped_propagated_R", fake_compute_grouped_r)
 
     (R,) = runtime.layer_R_provider(0, ["proj"])
 
-    assert calls == [False]
-    assert torch.equal(torch.from_numpy(R), torch.full((4, 3), 2.0))
+    assert calls == [(2, False)]
+    assert torch.equal(torch.from_numpy(R), torch.full((4, 3), 8.0))
