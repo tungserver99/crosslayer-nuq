@@ -127,6 +127,8 @@ class CrossLayerPropagationRuntime:
             X = self.current_inputs[module_name]
             D = self.current_signed[module_name]
             R = compute_propagated_R(X, D, self.c, normalize_by_tokens=False)
+            # H is averaged over output rows/groups; distribute scalar feedback across rows.
+            R = R / D.shape[-1]
             layer_R.append(R.cpu().float().numpy())
             logging.info(f"[Layer {layer_idx}][{module_name}] Computed propagated R GEMM in {time.perf_counter() - r_start:.2f}s")
         return layer_R
@@ -299,6 +301,7 @@ def endloss_crosslayer_nuq(
         cpu_count=cpu_count,
     )
     logging.info("Packing complete.")
+
 
 
 

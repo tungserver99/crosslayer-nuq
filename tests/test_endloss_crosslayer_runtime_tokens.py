@@ -75,3 +75,27 @@ def test_prepare_calibration_batches_keeps_2d_tokens():
     batches = runtime._prepare_calibration_batches(tokens)
 
     assert batches[0] is tokens[0]
+
+
+def test_layer_r_provider_keeps_token_sum_and_scales_by_output_rows(monkeypatch):
+    runtime_module = load_runtime_module()
+    runtime = runtime_module.CrossLayerPropagationRuntime.__new__(
+        runtime_module.CrossLayerPropagationRuntime
+    )
+    runtime.current_layer_idx = 0
+    runtime.current_inputs = {"proj": torch.ones(1, 2, 3)}
+    runtime.current_signed = {"proj": torch.ones(1, 2, 4)}
+    runtime.c = torch.ones(2)
+
+    calls = []
+
+    def fake_compute_propagated_r(X, D, c, normalize_by_tokens=True):
+        calls.append(normalize_by_tokens)
+        return torch.full((D.shape[-1], X.shape[-1]), 8.0)
+
+    monkeypatch.setattr(runtime_module, "compute_propagated_R", fake_compute_propagated_r)
+
+    (R,) = runtime.layer_R_provider(0, ["proj"])
+
+    assert calls == [False]
+    assert torch.equal(torch.from_numpy(R), torch.full((4, 3), 2.0))

@@ -144,32 +144,51 @@ def update_C_with_r(
     group_size = output_dim // num_groups
     n_cluster = C.shape[-1]
     sub_channel_size = 64
-    eye = torch.eye(n_cluster, dtype=W.dtype, device=device).unsqueeze(0)
+    sub_input_size = 2 ** 16
+    lambda_reg = 1e-7
     result_chunks = []
 
     num_centroid_chunks = sum((group_size + sub_channel_size - 1) // sub_channel_size for _ in range(num_groups))
     pb = get_progress_bar(num_centroid_chunks, "Updating centroids")
 
+    sqrt_lambda = torch.sqrt(torch.tensor(lambda_reg, dtype=W.dtype, device=device))
+    reg_eye = sqrt_lambda * torch.eye(n_cluster, dtype=W.dtype, device=device)
+
     for group_idx in range(num_groups):
         group_start = group_idx * group_size
         group_end = group_start + group_size
         h = H[group_idx]
-        hw_minus_r_group = W[group_start:group_end] @ h - R[group_start:group_end]
+        L = torch.linalg.cholesky(h)
+        reduced_X = L.transpose(-2, -1)
+        W_group = W[group_start:group_end]
+        R_group = R[group_start:group_end]
+        linv_r = torch.linalg.solve_triangular(L, R_group.transpose(0, 1), upper=False).transpose(0, 1)
+        reduced_target = W_group @ reduced_X.transpose(0, 1) - linv_r
 
         for start in range(group_start, group_end, sub_channel_size):
             end = min(start + sub_channel_size, group_end)
             local_start = start - group_start
             local_end = end - group_start
             labels_batch = labels[start:end]
-            P = torch.nn.functional.one_hot(labels_batch, num_classes=n_cluster).to(dtype=W.dtype)
+            batch_size = end - start
+            P_batch = torch.nn.functional.one_hot(labels_batch, num_classes=n_cluster).to(dtype=W.dtype)
 
-            A = torch.einsum("bik,ij,bjl->bkl", P, h, P)
-            b = torch.einsum("bik,bi->bk", P, hw_minus_r_group[local_start:local_end])
-            A = A + 1e-7 * eye
-            try:
-                C_hat_batch = torch.linalg.solve(A, b)
-            except RuntimeError:
-                C_hat_batch = torch.linalg.lstsq(A, b.unsqueeze(-1)).solution.squeeze(-1)
+            A_batch_list = []
+            b_batch_list = []
+            for st_idx_inp in range(0, input_dim, sub_input_size):
+                end_idx_inp = min(input_dim, st_idx_inp + sub_input_size)
+                X_batch = reduced_X[st_idx_inp:end_idx_inp]
+                A_batch_list.append(torch.einsum("bj,ijc->ibc", X_batch, P_batch))
+                b_batch_list.append(reduced_target[local_start:local_end, st_idx_inp:end_idx_inp].unsqueeze(-1))
+
+            A_batch = torch.cat(A_batch_list, dim=1)
+            b_batch = torch.cat(b_batch_list, dim=1)
+            A_batch = torch.cat([A_batch, reg_eye.unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
+            b_batch = torch.cat(
+                [b_batch, torch.zeros((batch_size, n_cluster, 1), dtype=W.dtype, device=device)],
+                dim=1,
+            )
+            C_hat_batch = torch.linalg.lstsq(A_batch, b_batch).solution.squeeze(-1)
             result_chunks.append(C_hat_batch)
             pb.update(1)
 
@@ -218,11 +237,8 @@ def train_least_squares_with_r(
 
     start_time = time.time()
     for iteration in range(num_iterations):
-        if iteration > 0:
-            logging.info(f"Iteration {iteration + 1}: updating P assignments")
-            labels = update_P_with_r(W_t, H_t, labels, C, R_t, cd_cycles=cd_cycles)
-        else:
-            logging.info(f"Iteration {iteration + 1}: using initialization assignments before first C update")
+        logging.info(f"Iteration {iteration + 1}: updating P assignments")
+        labels = update_P_with_r(W_t, H_t, labels, C, R_t, cd_cycles=cd_cycles)
 
         obj_after_p = objective_function_with_r(W_t, H_t, labels, C, R_t).item()
         log_dict["objective"].append(obj_after_p)
@@ -452,7 +468,3 @@ def seed(
             logging.info(f"[Layer {l}] Loaded weights/init/Hessian cache in {time.perf_counter() - load_wait_start:.2f}s")
             save_payload = run_layer(l, loaded)
             _save_results(output_folder, seed_precision, seed_precision, *save_payload, l)
-
-
-
-
